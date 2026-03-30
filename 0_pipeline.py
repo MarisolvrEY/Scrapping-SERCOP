@@ -287,31 +287,66 @@ def extraer_rango(driver, wait, fecha_desde_str, fecha_hasta_str):
     return total
 
 
+FECHA_LIMITE = datetime(2020, 1, 1)   # no scrapeamos antes de esta fecha
+
+
+def rangos_ya_scrapeados():
+    """
+    Lee los HTMLs existentes en CARPETA_HTML y devuelve un set de
+    strings 'fecha_desde_fecha_hasta' ya scrapeados.
+    """
+    vistos = set()
+    for archivo in glob.glob(os.path.join(CARPETA_HTML, "*.html")):
+        nombre = os.path.basename(archivo)
+        partes = nombre.split("_pagina_")
+        if len(partes) == 2:
+            vistos.add(partes[0])  # ej: "2025-09-28_2026-03-27"
+    return vistos
+
+
 def paso1_scraping(driver, wait):
     print("\n" + "═"*60)
     print("PASO 1 — SCRAPING ITERATIVO")
     print("═"*60)
 
     os.makedirs(CARPETA_HTML, exist_ok=True)
+
+    # Detectar rangos ya scrapeados para poder resumir si se cortó
+    ya_scrapeados = rangos_ya_scrapeados()
+    if ya_scrapeados:
+        print(f"  ℹ️  {len(ya_scrapeados)} rango(s) previo(s) detectado(s) — se omitirán")
+
     fecha_hasta = datetime.today()
     rango_num   = 1
 
-    while True:
-        fecha_desde  = fecha_hasta - timedelta(days=INTERVALO_DIAS)
-        fh_str       = fecha_hasta.strftime("%Y-%m-%d")
-        fd_str       = fecha_desde.strftime("%Y-%m-%d")
+    while fecha_hasta > FECHA_LIMITE:
+        fecha_desde = max(
+            fecha_hasta - timedelta(days=INTERVALO_DIAS),
+            FECHA_LIMITE
+        )
+        fh_str = fecha_hasta.strftime("%Y-%m-%d")
+        fd_str = fecha_desde.strftime("%Y-%m-%d")
+        clave  = f"{fd_str}_{fh_str}"
+
+        # Saltar si ya fue scrapeado en una ejecución anterior
+        if clave in ya_scrapeados:
+            print(f"\n⏭️  Rango #{rango_num} ya scrapeado: {fd_str} → {fh_str} — omitiendo")
+            fecha_hasta = fecha_desde - timedelta(days=1)
+            rango_num  += 1
+            continue
 
         print(f"\n🔍 Rango #{rango_num}: {fd_str} → {fh_str}")
-        total = extraer_rango(driver, wait, fd_str, fh_str)
-
-        if total == 0:
-            print(f"\n⛔ Rango #{rango_num} sin resultados — fin del scraping.")
-            break
+        try:
+            total = extraer_rango(driver, wait, fd_str, fh_str)
+            print(f"  ✅ {total} proceso(s) encontrados")
+        except Exception as e:
+            print(f"  ❌ Error en rango {fd_str}→{fh_str}: {e}")
+            print("  ⚠️  El rango se saltará — los datos anteriores están guardados")
 
         fecha_hasta = fecha_desde - timedelta(days=1)
         rango_num  += 1
 
-    print(f"\n✅ PASO 1 COMPLETADO — {rango_num - 1} rango(s) procesados")
+    print(f"\n✅ PASO 1 COMPLETADO — llegamos a {FECHA_LIMITE.strftime('%Y-%m-%d')}")
 
 
 # ── PASO 2: PARSEO ────────────────────────────────────────────────
@@ -496,12 +531,26 @@ def main():
     driver = iniciar_driver()
     wait   = WebDriverWait(driver, 20)
 
+    paso1_ok = False
     try:
         paso1_scraping(driver, wait)
-        paso2_parseo()
-        paso3_descargas(driver, wait)
+        paso1_ok = True
     except KeyboardInterrupt:
-        print("\n⚠️  Interrumpido")
+        print("\n⚠️  Scraping interrumpido — continuando con los datos ya guardados...")
+    except Exception as e:
+        print(f"\n❌ Error en paso 1: {e}")
+        import traceback; traceback.print_exc()
+        print("⚠️  Continuando con los datos ya guardados...")
+
+    # Pasos 2 y 3 siempre se ejecutan sobre lo que haya
+    try:
+        n = paso2_parseo()
+        if n > 0:
+            paso3_descargas(driver, wait)
+        else:
+            print("\n⚠️  Sin procesos para descargar")
+    except KeyboardInterrupt:
+        print("\n⚠️  Pipeline interrumpido")
     except Exception as e:
         print(f"\n❌ Error: {e}")
         import traceback; traceback.print_exc()
