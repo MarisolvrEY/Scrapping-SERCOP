@@ -1,0 +1,10 @@
+# Web scraping
+selenium==4.20.0
+beautifulsoup4==4.12.3
+
+# HTTP
+requests==2.31.0
+urllib3==2.2.1
+
+# Configuración
+python-dotenv==1.0.1
