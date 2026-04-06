@@ -43,17 +43,15 @@ def aceptar_cookies(driver, wait):
 
 def ya_descargado(codigo, carpeta_raiz):
     """
-    Devuelve True si la carpeta del proceso ya existe Y contiene
-    al menos un archivo (PDF u otro) además del datos_proceso.json.
+    Devuelve True solo si la carpeta tiene archivos Y también tiene datos_proceso.json.
+    Si tiene PDFs pero no tiene JSON, devuelve False para que se genere el JSON.
     """
     carpeta = os.path.join(carpeta_raiz, codigo.strip().replace("/", "-"))
     if not os.path.isdir(carpeta):
         return False
-    archivos = [
-        f for f in os.listdir(carpeta)
-        if f != "datos_proceso.json"
-    ]
-    return len(archivos) > 0
+    tiene_archivos = any(f != "datos_proceso.json" for f in os.listdir(carpeta))
+    tiene_json     = os.path.exists(os.path.join(carpeta, "datos_proceso.json"))
+    return tiene_archivos and tiene_json
 
 
 # ─── PESTAÑAS ─────────────────────────────────────────────────────────────────
