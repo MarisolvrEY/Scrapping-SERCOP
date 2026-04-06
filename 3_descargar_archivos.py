@@ -3,6 +3,8 @@ import re
 import json
 import time
 import requests
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -14,6 +16,7 @@ load_dotenv(Path(__file__).parent / ".env")
 # ─── CONFIGURACIÓN ────────────────────────────────────────────────────────────
 ARCHIVO_JSON      = os.getenv("ARCHIVO_JSON",      "procesos_sercop.json")
 CARPETA_DESCARGAS = os.getenv("CARPETA_DESCARGAS", "archivos_procesos")
+NUM_WORKERS       = multiprocessing.cpu_count()   # un hilo por núcleo
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -21,7 +24,9 @@ def iniciar_driver():
     options = webdriver.ChromeOptions()
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--start-maximized")
+    options.add_argument("--headless=new")        # headless para paralelizar sin conflictos de ventana
+    options.add_argument("--window-size=1280,900")
+    options.add_argument("--disable-gpu")
     return webdriver.Chrome(options=options)
 
 
@@ -34,19 +39,28 @@ def aceptar_cookies(driver, wait):
         pass
 
 
+# ─── SKIP: proceso ya descargado ─────────────────────────────────────────────
+
+def ya_descargado(codigo, carpeta_raiz):
+    """
+    Devuelve True si la carpeta del proceso ya existe Y contiene
+    al menos un archivo (PDF u otro) además del datos_proceso.json.
+    """
+    carpeta = os.path.join(carpeta_raiz, codigo.strip().replace("/", "-"))
+    if not os.path.isdir(carpeta):
+        return False
+    archivos = [
+        f for f in os.listdir(carpeta)
+        if f != "datos_proceso.json"
+    ]
+    return len(archivos) > 0
+
+
 # ─── PESTAÑAS ─────────────────────────────────────────────────────────────────
 
 def obtener_pestañas(driver):
-    """
-    Lee todas las pestañas del tabmenu y devuelve lista de (nombre, elemento).
-    """
     tabs = driver.find_elements(By.XPATH, "//ul[@id='tabmenu']//li//a")
-    resultado = []
-    for tab in tabs:
-        nombre = tab.text.strip()
-        if nombre:
-            resultado.append((nombre, tab))
-    return resultado
+    return [(tab.text.strip(), tab) for tab in tabs if tab.text.strip()]
 
 
 def click_pestaña(driver, elemento):
@@ -54,20 +68,12 @@ def click_pestaña(driver, elemento):
     time.sleep(2)
 
 
-# ─── EXTRACTOR GENÉRICO: one-column-emphasis ──────────────────────────────────
-# Usado por: Descripción, Fechas
-# Estructura: <th> label | <td> valor (| <td> descripción ignorada)
+# ─── EXTRACTORES ──────────────────────────────────────────────────────────────
 
 def extraer_one_column_emphasis(driver):
-    """
-    Lee todas las filas th/td de table#one-column-emphasis.
-    Devuelve dict {label: valor}.
-    """
     resultado = {}
     try:
-        filas = driver.find_elements(
-            By.XPATH, "//table[@id='one-column-emphasis']//tr"
-        )
+        filas = driver.find_elements(By.XPATH, "//table[@id='one-column-emphasis']//tr")
         for fila in filas:
             th = fila.find_elements(By.TAG_NAME, "th")
             td = fila.find_elements(By.TAG_NAME, "td")
@@ -81,21 +87,10 @@ def extraer_one_column_emphasis(driver):
     return resultado
 
 
-# ─── EXTRACTOR GENÉRICO: rounded-corner SIMPLE ────────────────────────────────
-# Usado por: Productos, Localidad, Parámetros de Calificación y cualquier tabla nueva
-# Lee cabeceras dinámicamente del thead (o primera fila con th).
-# Detecta fila TOTAL por colspan > 1 en primera celda o texto TOTAL.
-
 def extraer_rounded_corner(driver, xpath_tabla="//fieldset[@id='cuadro']//table[@id='rounded-corner']"):
-    """
-    Extrae UNA tabla rounded-corner de forma genérica.
-    Devuelve {cabeceras: [...], filas: [...], total: str|None}
-    """
     resultado = {"cabeceras": [], "filas": [], "total": None}
     try:
         tabla = driver.find_element(By.XPATH, xpath_tabla)
-
-        # Leer cabeceras: buscar primer tr con th
         cabeceras = []
         for tr in tabla.find_elements(By.XPATH, ".//tr"):
             ths = tr.find_elements(By.TAG_NAME, "th")
@@ -105,92 +100,51 @@ def extraer_rounded_corner(driver, xpath_tabla="//fieldset[@id='cuadro']//table[
                     cabeceras = textos
                     break
         resultado["cabeceras"] = cabeceras
-
-        # Leer filas de datos
         for tr in tabla.find_elements(By.XPATH, ".//tbody/tr"):
             celdas = tr.find_elements(By.TAG_NAME, "td")
             ths    = tr.find_elements(By.TAG_NAME, "th")
-
             if not celdas and not ths:
                 continue
-
-            # Fila TOTAL: tiene th o td con colspan o texto TOTAL
             texto_fila = tr.text.strip()
             primera = celdas[0] if celdas else ths[0]
             colspan = int(primera.get_attribute("colspan") or 1)
-
             if "TOTAL" in texto_fila.upper() and (colspan > 1 or len(celdas) + len(ths) < len(cabeceras)):
-                ultima = (celdas or ths)[-1]
-                resultado["total"] = ultima.text.strip()
+                resultado["total"] = (celdas or ths)[-1].text.strip()
                 continue
-
-            # Fila de dato normal — mapear por cabeceras si hay, o lista plana
             valores = [c.text.strip() for c in celdas]
             if cabeceras and len(valores) == len(cabeceras):
                 resultado["filas"].append(dict(zip(cabeceras, valores)))
             elif valores:
                 resultado["filas"].append(valores)
-
     except Exception as e:
         resultado["_error"] = str(e)
     return resultado
 
 
-# ─── EXTRACTOR: CRITERIOS DE INCLUSIÓN ───────────────────────────────────────
-# Caso especial: múltiples tablas rounded-corner dentro de fieldset#cuadro,
-# cada una seguida de un <div align="right"> con el puntaje máximo.
-
 def extraer_criterios(driver):
-    """
-    Itera cada table#rounded-corner dentro de fieldset#cuadro.
-    Por cada tabla:
-      - tipo: primer <th> del thead (si existe)
-      - puntaje_maximo: número del <div align=right> inmediatamente siguiente
-      - criterios: filas de datos con {criterio, descripcion, puntaje}
-        (maneja rowspan: fila con 2 td hereda el criterio de la fila anterior)
-    Al final captura el TOTAL general si existe.
-    """
     grupos = []
     try:
         fieldset = driver.find_element(By.XPATH, "//fieldset[@id='cuadro']")
         tablas   = fieldset.find_elements(By.XPATH, ".//table[@id='rounded-corner']")
-
         for tabla in tablas:
-            # Tipo desde thead
             tipo = ""
             ths_head = tabla.find_elements(By.XPATH, ".//thead//th")
             if ths_head:
                 tipo = ths_head[0].text.strip()
-
-            # Criterios desde tbody
-            criterios   = []
-            criterio_act = ""
+            criterios, criterio_act = [], ""
             for tr in tabla.find_elements(By.XPATH, ".//tbody/tr"):
                 celdas = tr.find_elements(By.TAG_NAME, "td")
                 if len(celdas) == 3:
                     criterio_act = celdas[0].text.strip()
-                    criterios.append({
-                        "criterio":    criterio_act,
-                        "descripcion": celdas[1].text.strip(),
-                        "puntaje":     celdas[2].text.strip(),
-                    })
+                    criterios.append({"criterio": criterio_act, "descripcion": celdas[1].text.strip(), "puntaje": celdas[2].text.strip()})
                 elif len(celdas) == 2:
-                    # Fila con rowspan: reutiliza criterio_act
-                    criterios.append({
-                        "criterio":    criterio_act,
-                        "descripcion": celdas[0].text.strip(),
-                        "puntaje":     celdas[1].text.strip(),
-                    })
-
-            # Puntaje máximo: primer <div> con número después de esta tabla
+                    criterios.append({"criterio": criterio_act, "descripcion": celdas[0].text.strip(), "puntaje": celdas[1].text.strip()})
             puntaje_maximo = ""
             try:
                 texto_div = driver.execute_script("""
-                    var t = arguments[0];
-                    var sib = t.nextElementSibling;
+                    var t = arguments[0], sib = t.nextElementSibling;
                     while (sib) {
-                        var txt = sib.textContent.trim();
-                        if (sib.tagName === 'DIV' && /\\d/.test(txt)) return txt;
+                        if (sib.tagName === 'DIV' && /\\d/.test(sib.textContent.trim())) return sib.textContent;
                         if (sib.tagName === 'TABLE') break;
                         sib = sib.nextElementSibling;
                     }
@@ -200,14 +154,7 @@ def extraer_criterios(driver):
                 puntaje_maximo = m.group(1) if m else ""
             except Exception:
                 pass
-
-            grupos.append({
-                "tipo":           tipo,
-                "puntaje_maximo": puntaje_maximo,
-                "criterios":      criterios,
-            })
-
-        # TOTAL general
+            grupos.append({"tipo": tipo, "puntaje_maximo": puntaje_maximo, "criterios": criterios})
         try:
             div_total = fieldset.find_element(By.XPATH, ".//div[contains(text(),'TOTAL')]")
             m = re.search(r"(\d+)", div_total.text)
@@ -215,14 +162,51 @@ def extraer_criterios(driver):
                 grupos.append({"tipo": "TOTAL", "puntaje_maximo": m.group(1), "criterios": []})
         except Exception:
             pass
-
     except Exception as e:
         grupos.append({"_error": str(e)})
-
     return grupos
 
 
-# ─── EXTRACTOR: ARCHIVOS ──────────────────────────────────────────────────────
+def extraer_parametros_calificacion(driver):
+    resultado = {"parametros": [], "total": ""}
+    try:
+        tabla = driver.find_element(By.XPATH, "//fieldset[@id='cuadro']//table[@id='rounded-corner']")
+        for tr in tabla.find_elements(By.XPATH, ".//tbody/tr"):
+            tds = tr.find_elements(By.TAG_NAME, "td")
+            ths = tr.find_elements(By.TAG_NAME, "th")
+            if ths and not tds:
+                resultado["total"] = ths[-1].text.strip()
+                continue
+            if len(tds) >= 3:
+                resultado["parametros"].append({
+                    "parametro":   tds[0].text.strip(),
+                    "descripcion": tds[1].text.strip(),
+                    "porcentaje":  tds[2].text.strip(),
+                })
+    except Exception as e:
+        resultado["_error"] = str(e)
+    return resultado
+
+
+def extraer_localidad(driver):
+    resultado = {"cabeceras": [], "filas": []}
+    try:
+        tabla = driver.find_element(By.XPATH, "//div[@id='content']//table[@id='rounded-corner']")
+        cabeceras = [th.text.strip() for th in tabla.find_elements(By.XPATH, ".//thead//th") if th.text.strip()]
+        resultado["cabeceras"] = cabeceras
+        for tr in tabla.find_elements(By.XPATH, ".//tbody/tr"):
+            tds    = tr.find_elements(By.TAG_NAME, "td")
+            valores = [td.text.strip() for td in tds]
+            if cabeceras and len(valores) == len(cabeceras):
+                resultado["filas"].append(dict(zip(cabeceras, valores)))
+            elif valores:
+                resultado["filas"].append(valores)
+    except Exception as e:
+        resultado["_error"] = str(e)
+    return resultado
+
+
+# ─── ARCHIVOS ─────────────────────────────────────────────────────────────────
 
 def obtener_links_descarga(driver):
     links = driver.find_elements(By.XPATH, "//a[contains(@href,'bajarArchivo.cpe')]")
@@ -232,17 +216,13 @@ def obtener_links_descarga(driver):
         if not href:
             continue
         try:
-            fila = link.find_element(By.XPATH, "./ancestor::tr[1]")
-            fila_ant = driver.execute_script(
-                "return arguments[0].previousElementSibling;", fila
-            )
-            descripcion = fila_ant.text.strip() if fila_ant else "archivo"
+            fila     = link.find_element(By.XPATH, "./ancestor::tr[1]")
+            fila_ant = driver.execute_script("return arguments[0].previousElementSibling;", fila)
+            desc     = fila_ant.text.strip() if fila_ant else "archivo"
         except Exception:
-            descripcion = "archivo"
-        if not descripcion:
-            descripcion = "archivo"
+            desc = "archivo"
         if href not in [r[1] for r in resultado]:
-            resultado.append((descripcion, href))
+            resultado.append((desc or "archivo", href))
     return resultado
 
 
@@ -257,10 +237,10 @@ def descargar_archivo(url, carpeta, nombre_sugerido, cookies_selenium, indice):
         if "filename=" in cd:
             nombre = cd.split("filename=")[-1].strip().strip('"')
         else:
-            ext = ".pdf" if "pdf" in resp.headers.get("Content-Type", "").lower() else ""
+            ext    = ".pdf" if "pdf" in resp.headers.get("Content-Type", "").lower() else ""
             nombre = f"{indice:02d}_{nombre_sugerido[:60]}{ext}"
         nombre = "".join(c for c in nombre if c not in r'\/:*?"<>|')
-        ruta = os.path.join(carpeta, nombre)
+        ruta   = os.path.join(carpeta, nombre)
         with open(ruta, "wb") as f:
             for chunk in resp.iter_content(8192):
                 f.write(chunk)
@@ -271,94 +251,25 @@ def descargar_archivo(url, carpeta, nombre_sugerido, cookies_selenium, indice):
         return False, None
 
 
-# ─── DESPACHADOR DE PESTAÑAS ──────────────────────────────────────────────────
+# ─── DESPACHADOR ──────────────────────────────────────────────────────────────
 
-PESTAÑAS_CRITERIOS    = {"criterios de inclusión"}
-PESTAÑAS_ONE_COLUMN   = {"descripción", "fechas"}
-PESTAÑAS_ARCHIVOS     = {"archivos"}
-PESTAÑAS_PARAMETROS   = {"parámetros de calificación"}
-PESTAÑAS_LOCALIDAD    = {"localidad"}
+PESTAÑAS_CRITERIOS  = {"criterios de inclusión"}
+PESTAÑAS_ONE_COLUMN = {"descripción", "fechas"}
+PESTAÑAS_ARCHIVOS   = {"archivos"}
+PESTAÑAS_PARAMETROS = {"parámetros de calificación"}
+PESTAÑAS_LOCALIDAD  = {"localidad"}
 
-def extraer_parametros_calificacion(driver):
-    """
-    Extrae table#rounded-corner de Parámetros de Calificación.
-    Estructura: 3 columnas (parametro | descripcion | porcentaje).
-    Fila TOTAL: tiene <th> con colspan.
-    """
-    resultado = {"parametros": [], "total": ""}
-    try:
-        tabla = driver.find_element(
-            By.XPATH, "//fieldset[@id='cuadro']//table[@id='rounded-corner']"
-        )
-        for tr in tabla.find_elements(By.XPATH, ".//tbody/tr"):
-            tds = tr.find_elements(By.TAG_NAME, "td")
-            ths = tr.find_elements(By.TAG_NAME, "th")
-
-            # Fila TOTAL: solo <th>
-            if ths and not tds:
-                # Último <th> tiene el valor total
-                resultado["total"] = ths[-1].text.strip()
-                continue
-
-            # Fila vacía de cabecera (th colspan=3 vacío)
-            if ths and len(tds) == 0:
-                continue
-
-            if len(tds) >= 3:
-                resultado["parametros"].append({
-                    "parametro":   tds[0].text.strip(),
-                    "descripcion": tds[1].text.strip(),
-                    "porcentaje":  tds[2].text.strip(),
-                })
-    except Exception as e:
-        resultado["_error"] = str(e)
-    return resultado
-
-
-def extraer_localidad(driver):
-    """
-    Extrae table#rounded-corner de Localidad (dentro de div#content, sin fieldset).
-    Lee columnas dinámicamente del thead.
-    """
-    resultado = {"cabeceras": [], "filas": []}
-    try:
-        tabla = driver.find_element(
-            By.XPATH, "//div[@id='content']//table[@id='rounded-corner']"
-        )
-        # Cabeceras dinámicas
-        cabeceras = [
-            th.text.strip()
-            for th in tabla.find_elements(By.XPATH, ".//thead//th")
-            if th.text.strip()
-        ]
-        resultado["cabeceras"] = cabeceras
-
-        for tr in tabla.find_elements(By.XPATH, ".//tbody/tr"):
-            tds = tr.find_elements(By.TAG_NAME, "td")
-            valores = [td.text.strip() for td in tds]
-            if cabeceras and len(valores) == len(cabeceras):
-                resultado["filas"].append(dict(zip(cabeceras, valores)))
-            elif valores:
-                resultado["filas"].append(valores)
-    except Exception as e:
-        resultado["_error"] = str(e)
-    return resultado
 
 def extraer_pestaña(driver, nombre, carpeta_proceso, cookies_fn):
     nombre_lower = nombre.lower().strip()
-
     if nombre_lower in PESTAÑAS_ONE_COLUMN:
         return extraer_one_column_emphasis(driver)
-
     if nombre_lower in PESTAÑAS_CRITERIOS:
         return extraer_criterios(driver)
-
     if nombre_lower in PESTAÑAS_LOCALIDAD:
         return extraer_localidad(driver)
-
     if nombre_lower in PESTAÑAS_PARAMETROS:
         return extraer_parametros_calificacion(driver)
-
     if nombre_lower in PESTAÑAS_ARCHIVOS:
         links = obtener_links_descarga(driver)
         archivos_info = []
@@ -373,18 +284,14 @@ def extraer_pestaña(driver, nombre, carpeta_proceso, cookies_fn):
         else:
             print("      ℹ️  Sin archivos")
         return archivos_info
-
-    # Cualquier otra pestaña desconocida → rounded-corner genérico
     return extraer_rounded_corner(driver)
 
 
-# ─── PROCESAMIENTO POR PROCESO ────────────────────────────────────────────────
+# ─── PROCESAMIENTO DE UN PROCESO ──────────────────────────────────────────────
 
 def procesar_proceso(driver, wait, proceso, carpeta_raiz):
     codigo = proceso["codigo"].strip().replace("/", "-")
     link   = proceso["link"]
-
-    print(f"\n  [{codigo}] {proceso.get('objeto_proceso','')[:60]}...")
 
     carpeta_proceso = os.path.join(carpeta_raiz, codigo)
     os.makedirs(carpeta_proceso, exist_ok=True)
@@ -394,9 +301,7 @@ def procesar_proceso(driver, wait, proceso, carpeta_raiz):
         "entidad_contratante": proceso.get("entidad_contratante", ""),
         "objeto_proceso":      proceso.get("objeto_proceso", ""),
         "link":                link,
-        "pestañas":            {
-            "Parámetros de Calificación": {}  # siempre presente, vacío si no existe en el proceso
-        },
+        "pestañas":            {"Parámetros de Calificación": {}},
     }
 
     try:
@@ -412,10 +317,7 @@ def procesar_proceso(driver, wait, proceso, carpeta_raiz):
             print(f"    🔍 {nombre}")
             try:
                 click_pestaña(driver, elemento)
-                contenido = extraer_pestaña(
-                    driver, nombre, carpeta_proceso,
-                    cookies_fn=driver.get_cookies
-                )
+                contenido = extraer_pestaña(driver, nombre, carpeta_proceso, cookies_fn=driver.get_cookies)
                 datos["pestañas"][nombre] = contenido
             except Exception as e:
                 print(f"      ⚠️  Error: {e}")
@@ -434,6 +336,35 @@ def procesar_proceso(driver, wait, proceso, carpeta_raiz):
     return datos
 
 
+# ─── WORKER (un hilo = un driver) ─────────────────────────────────────────────
+
+def worker(procesos_chunk, carpeta_raiz, worker_id):
+    """
+    Cada worker tiene su propio driver Chrome y procesa su porción de la lista.
+    """
+    driver = iniciar_driver()
+    wait   = WebDriverWait(driver, 15)
+    resultados = []
+    try:
+        for i, proceso in enumerate(procesos_chunk, 1):
+            codigo = proceso["codigo"].strip().replace("/", "-")
+            print(f"\n[W{worker_id}] ({i}/{len(procesos_chunk)}) {codigo}")
+
+            # ── SKIP si ya tiene archivos descargados ──
+            if ya_descargado(codigo, carpeta_raiz):
+                print(f"  ⏭️  Ya descargado — omitiendo")
+                continue
+
+            datos = procesar_proceso(driver, wait, proceso, carpeta_raiz)
+            resultados.append(datos)
+            time.sleep(1)
+    except Exception as e:
+        print(f"[W{worker_id}] ❌ Error: {e}")
+    finally:
+        driver.quit()
+    return resultados
+
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -444,31 +375,60 @@ def main():
     with open(ARCHIVO_JSON, "r", encoding="utf-8") as f:
         procesos = json.load(f)
 
-    print(f"📂 {len(procesos)} procesos cargados")
     os.makedirs(CARPETA_DESCARGAS, exist_ok=True)
 
-    driver = iniciar_driver()
-    wait   = WebDriverWait(driver, 15)
-    todos  = []
+    # Filtrar los que ya están completos
+    pendientes = [p for p in procesos if not ya_descargado(p["codigo"].strip().replace("/", "-"), CARPETA_DESCARGAS)]
+    omitidos   = len(procesos) - len(pendientes)
 
-    try:
-        for i, proceso in enumerate(procesos, 1):
-            print(f"\n{'='*60}")
-            print(f"Proceso {i}/{len(procesos)}")
-            datos = procesar_proceso(driver, wait, proceso, CARPETA_DESCARGAS)
-            todos.append(datos)
-            time.sleep(1)
+    print(f"📂 {len(procesos)} procesos totales")
+    print(f"  ⏭️  {omitidos} ya descargados — omitidos")
+    print(f"  🔄 {len(pendientes)} pendientes")
+    print(f"  🖥️  {NUM_WORKERS} workers (núcleos detectados)")
 
-    except KeyboardInterrupt:
-        print("\n⚠️  Interrumpido")
+    if not pendientes:
+        print("✅ Todo ya está descargado.")
+        return
 
-    finally:
-        ruta = os.path.join(CARPETA_DESCARGAS, "consolidado.json")
-        with open(ruta, "w", encoding="utf-8") as f:
-            json.dump(todos, f, ensure_ascii=False, indent=2)
-        print(f"\n{'='*60}")
-        print(f"🎉 {len(todos)} procesos | Consolidado: '{ruta}'")
-        driver.quit()
+    # Dividir en chunks iguales por worker
+    chunks = [pendientes[i::NUM_WORKERS] for i in range(NUM_WORKERS)]
+    chunks = [c for c in chunks if c]   # quitar chunks vacíos si hay menos procesos que workers
+
+    todos = []
+    with ThreadPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        futuros = {
+            executor.submit(worker, chunk, CARPETA_DESCARGAS, idx + 1): idx
+            for idx, chunk in enumerate(chunks)
+        }
+        for futuro in as_completed(futuros):
+            try:
+                resultado = futuro.result()
+                todos.extend(resultado)
+            except Exception as e:
+                print(f"❌ Worker falló: {e}")
+
+    # Guardar consolidado
+    ruta = os.path.join(CARPETA_DESCARGAS, "consolidado.json")
+
+    # Cargar consolidado existente y agregar nuevos (no sobreescribir lo anterior)
+    existente = []
+    if os.path.exists(ruta):
+        try:
+            with open(ruta, "r", encoding="utf-8") as f:
+                existente = json.load(f)
+        except Exception:
+            existente = []
+
+    codigos_existentes = {e["codigo"] for e in existente}
+    nuevos = [d for d in todos if d["codigo"] not in codigos_existentes]
+    consolidado = existente + nuevos
+
+    with open(ruta, "w", encoding="utf-8") as f:
+        json.dump(consolidado, f, ensure_ascii=False, indent=2)
+
+    print(f"\n{'='*60}")
+    print(f"🎉 {len(todos)} proceso(s) nuevos procesados")
+    print(f"   Consolidado total: {len(consolidado)} | '{ruta}'")
 
 
 if __name__ == "__main__":
