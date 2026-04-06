@@ -29,7 +29,7 @@ build/
 *.ntvs*
 *.njsproj
 *.sln
-
+.partes_json/
 # ─── OS ───────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
